@@ -1,0 +1,4 @@
+DrissionPage
+numpy
+pandas
+psycopg[binary]
