@@ -8,79 +8,53 @@ from consts import IS_LOCAL, PROXY_PORT, ZONEINFO
 
 
 class Scraper(LoggerClient):
-    def __init__(self, name, db_configs=None, headless=False):
+    def __init__(self, name, db_configs=None, headless=False, browser_enabled=True):
         self.name = name
         super().__init__(name)
         self.db = DBHandler(configs=db_configs)
-        so = SessionOptions()
-        co = ChromiumOptions()
-        co.auto_port()
+        self.browser_enabled = browser_enabled
 
-        if BROWSER_PATH:
-            co.set_browser_path(BROWSER_PATH)
+        if browser_enabled:
+            so = SessionOptions()
+            co = ChromiumOptions()
+            co.auto_port()
 
-        print('local', IS_LOCAL)
+            if BROWSER_PATH:
+                co.set_browser_path(BROWSER_PATH)
 
-        if IS_LOCAL:
-            if headless:
-                # co.set_argument('--headless')
+            print('local', IS_LOCAL)
 
+            if IS_LOCAL:
+                if headless:
+                    co.set_argument("--window-size=1920,1080")
+                    co.set_argument('--headless')
+                    co.set_user_agent(
+                        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36')
+
+                if PROXY_PORT:
+                    so.set_proxies(http=f'127.0.0.1:{PROXY_PORT}')
+            else:
                 co.set_argument("--window-size=1920,1080")
-                # co.set_argument("--disable-extensions")
-                # co.set_argument("--proxy-bypass-list=*")
-                # co.set_argument("--start-maximized")
+                co.set_argument('--incognito')
                 co.set_argument('--headless')
-                # co.set_argument('--disable-gpu')
-                # co.set_argument('--disable-dev-shm-usage')
-                # co.set_argument('--no-sandbox')
-                # co.set_argument('--ignore-certificate-errors')
+                co.set_argument('--disable-gpu')
+                co.set_argument('--no-sandbox')
                 co.set_user_agent(
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36')
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36')
 
-            if PROXY_PORT:
-                so.set_proxies(http=f'127.0.0.1:{PROXY_PORT}')
+            self.page = WebPage(session_or_options=so, chromium_options=co)
         else:
-            co.set_argument("--window-size=1920,1080")
-            co.set_argument('--incognito')
-            # co.set_argument("--disable-extensions")
-            # co.set_argument("--proxy-bypass-list=*")
-            # co.set_argument("--start-maximized")
-            co.set_argument('--headless')
-            co.set_argument('--disable-gpu')
-            # co.set_argument('--disable-dev-shm-usage')
-            co.set_argument('--no-sandbox')
-            # co.set_argument('--ignore-certificate-errors')
-            co.set_user_agent(
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36')
-
-            # from DrissionPage.easy_set import set_headless, set_paths
-            # set_headless(True)
-            # co.set_argument('--no-sandbox')
-            # co.set_argument('--headless')
-            # co.set_argument('--incognito')
-            # co.set_user_agent(
-            #     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36')
-            #
-            # co.set_argument("--window-size=1920,1080")
-            # co.set_argument("--disable-extensions")
-            # # co.set_argument("--proxy-server='direct://'")
-            # # co.set_argument("--proxy-bypass-list=*")
-            # # co.set_argument("--start-maximized")
-            # # co.set_argument('--headless')
-            # co.set_argument('--disable-gpu')
-            # # co.set_argument('--disable-dev-shm-usage')
-            # # co.set_argument('--no-sandbox')
-            # co.set_argument('--ignore-certificate-errors')
-            #
-            # co.set_user_agent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36')
-
-            # user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36'
-            # co.set_argument(f'user-agent={user_agent}')
-
-        self.page = WebPage(session_or_options=so, chromium_options=co)
+            self.page = None
 
         self.max_dt_map = None
         self.interval_seconds = 3600
+
+    def require_page(self):
+        if self.page is None:
+            raise RuntimeError(
+                'Browser-backed page is unavailable in browser-disabled mode.'
+            )
+        return self.page
 
     @staticmethod
     def current_dt_str():
@@ -130,8 +104,9 @@ class Scraper(LoggerClient):
             return num * 1000000000
 
     def switch_mode(self, mode):
-        if self.page.mode != mode:
-            self.page.change_mode(mode, go=False)
+        page = self.require_page()
+        if page.mode != mode:
+            page.change_mode(mode, go=False)
 
     def session_get(self, url, home=False):
         # 先用d模式打开网页自动加载headers
@@ -140,15 +115,15 @@ class Scraper(LoggerClient):
 
         if home is None:
             home = url.replace('https://', '').split('/')[0]
-        page = self.page
+        page = self.require_page()
         page.get('https://' + home)
         print('ready')
         self.switch_mode('s')
         page.get(url)
 
     def ele_by_xpath(self, xpath):
-        return self.page.ele(f'xpath:{xpath}')
+        return self.require_page().ele(f'xpath:{xpath}')
 
     def eles_by_xpath(self, xpath):
-        return self.page.eles(f'xpath:{xpath}')
+        return self.require_page().eles(f'xpath:{xpath}')
 

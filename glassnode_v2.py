@@ -2,7 +2,7 @@ from time import sleep, time
 from datetime import datetime
 import pandas as pd
 import numpy as np
-from json import dumps
+from json import dumps, loads
 
 from scraper import Scraper
 from config import (
@@ -18,9 +18,14 @@ pd.set_option('display.max_columns', None)
 pd.options.mode.chained_assignment = None
 
 class ZSScraper(Scraper):
-    def __init__(self, headless=False):
+    def __init__(self, headless=False, browser_enabled=True):
         self.name = 'ZS'
-        super().__init__(self.name, db_configs='zscope', headless=headless)
+        super().__init__(
+            self.name,
+            db_configs='zscope',
+            headless=headless,
+            browser_enabled=browser_enabled,
+        )
         self.from_time = 0
 
         self.to_do_list = []
@@ -30,6 +35,76 @@ class ZSScraper(Scraper):
         self.computed_items = None
 
         self.old_in_db_map = {}
+        self.composite_lookup = {
+            'ceo': {
+                'coins': ['BTC'],
+                'timeframe': '1d',
+                'dependencies': [
+                    'BTC_puell_1d',
+                    'BTC_mvrv_1d',
+                    'BTC_asopr_1d',
+                    'BTC_reserve_risk_1d',
+                ],
+            }
+            ,
+            'cycle_heat': {
+                'coins': ['BTC'],
+                'timeframe': '1d',
+                'dependencies': [
+                    'BTC_fear_greed_1d',
+                    'BTC_rhodl_ratio_1d',
+                    'BTC_supply_1y_pct_1d',
+                    'BTC_supply_pr_relative_1d',
+                ],
+            },
+            'crowding_stress': {
+                'coins': ['BTC'],
+                'timeframe': '1h',
+                'dependencies': [
+                    'BTC_funding_rate_1h',
+                    'BTC_nupl_1h',
+                    'BTC_mvrv_1h',
+                ],
+            },
+            'holder_pressure': {
+                'coins': ['BTC'],
+                'timeframe': '1h',
+                'dependencies': [
+                    'BTC_asopr_1h',
+                    'BTC_nrpl_1h',
+                    'BTC_sth_nupl_1h',
+                    'BTC_sth_mvrv_1h',
+                ],
+            },
+            'exchange_pressure': {
+                'coins': ['BTC'],
+                'timeframe': '1h',
+                'dependencies': [
+                    'BTC_inflow_1h',
+                    'BTC_balance_1h',
+                    'BTC_net_transfer_1h',
+                ],
+            },
+            'distribution_pressure': {
+                'coins': ['BTC'],
+                'timeframe': '1h',
+                'dependencies': [
+                    'BTC_holder_pressure_1h',
+                    'BTC_exchange_pressure_1h',
+                    'BTC_crowding_stress_1h',
+                ],
+            },
+            'valuation_stretch': {
+                'coins': ['BTC'],
+                'timeframe': '1d',
+                'dependencies': [
+                    'BTC_mvrv_1d',
+                    'BTC_asopr_1d',
+                    'BTC_rhodl_ratio_1d',
+                    'BTC_fear_greed_1d',
+                ],
+            },
+        }
 
         # excluded = ['ARPA', 'ATA', 'DUSK', 'NEAR', 'NULS', 'RUNE', 'XVS']
 
@@ -150,11 +225,17 @@ class ZSScraper(Scraper):
                 'path': 'indicators/reserve_risk',
                 'a': ['BTC'],
                 'i': ['24h'],
+                'query': {
+                    'referrer': 'charts',
+                }
             },
             'rhodl_ratio': {
                 'path': 'indicators/rhodl_ratio',
                 'a': ['BTC'],
                 'i': ['24h'],
+                'query': {
+                    'referrer': 'charts',
+                }
             },
             'funding_rate': {
                 'path': 'derivatives/futures_funding_rate_perpetual_v2',
@@ -250,9 +331,20 @@ class ZSScraper(Scraper):
                 return None
 
             if res.status_code == 200:
-                return res.json()
+                data = res.json()
+                required_plan = self._extract_required_plan(data)
+                if required_plan:
+                    raise PermissionError(
+                        f"Glassnode metric access denied for {url}: requiredPlan={required_plan}"
+                    )
+                return data
             elif res.status_code == 403 or res.status_code == 401:
                 self.log(res.text)
+                required_plan = self._extract_required_plan(res.text)
+                if required_plan:
+                    raise PermissionError(
+                        f"Glassnode metric access denied for {url}: requiredPlan={required_plan}"
+                    )
                 self.login()
                 self.page.change_mode('s', go=False)
                 return self.get_gn_data(url)
@@ -265,6 +357,88 @@ class ZSScraper(Scraper):
             return self.get_gn_data(url)
 
     @staticmethod
+    def _extract_required_plan(raw):
+        if isinstance(raw, dict):
+            return raw.get('requiredPlan')
+
+        if not isinstance(raw, str):
+            return None
+
+        text = raw.strip()
+        if not text or 'requiredPlan' not in text:
+            return None
+
+        try:
+            parsed = loads(text)
+        except Exception:
+            return None
+
+        if isinstance(parsed, dict):
+            return parsed.get('requiredPlan')
+        return None
+
+    def list_composite_targets(self):
+        targets = []
+        for item, options in self.composite_lookup.items():
+            timeframe = options['timeframe']
+            for coin in options['coins']:
+                targets.append(f'{coin}_{item}_{timeframe}')
+        return sorted(targets)
+
+    @staticmethod
+    def parse_target_parts(target):
+        prefix, timeframe = target.rsplit('_', 1)
+        coin, item = prefix.split('_', 1)
+        return coin, item, timeframe
+
+    def build_computed_items(self, composite_targets=None):
+        selected = set(composite_targets) if composite_targets else set(self.list_composite_targets())
+        computed_items = {}
+        for target in selected:
+            coin, item, timeframe = self.parse_target_parts(target)
+            options = self.composite_lookup.get(item)
+            if options is None:
+                raise ValueError(f'Unknown composite target: {target}')
+            if timeframe != options['timeframe']:
+                raise ValueError(f'Unsupported timeframe for composite target: {target}')
+            if coin not in options['coins']:
+                raise ValueError(f'Unsupported coin for composite target: {target}')
+            computed_items[target] = list(options['dependencies'])
+        return computed_items
+
+    def compute_composite_target(self, composite_target):
+        coin, item, _timeframe = self.parse_target_parts(composite_target)
+        method = getattr(self, 'get_' + item, None)
+        if method is None:
+            raise AttributeError(f'Composite method not implemented: {item}')
+        method(coin=coin)
+
+    def run_composites(self, composite_targets=None):
+        selected = set(composite_targets) if composite_targets else set(self.list_composite_targets())
+        self.db.connect()
+        try:
+            for target in sorted(selected):
+                self.compute_composite_target(target)
+        finally:
+            self.db.close()
+
+    @staticmethod
+    def _rolling_extreme_score(series, window, *, upper_scale=1.0, lower_scale=1.0, reverse=False, log_transform=False):
+        base = series.clip(lower=1e-9)
+        if log_transform:
+            base = np.log10(base)
+
+        rolling = base.rolling(window=window)
+        mean = rolling.mean()
+        std = rolling.std()
+        upper = mean + std * upper_scale
+        lower = mean - std * lower_scale
+
+        if reverse:
+            return np.where(base > upper, -1, np.where(base < lower, 1, 0))
+        return np.where(base > upper, 1, np.where(base < lower, -1, 0))
+
+    @staticmethod
     def to_second(v, delta):
         return int((v if len(str(v)) < 13 else v / 1000) - delta)
 
@@ -273,7 +447,7 @@ class ZSScraper(Scraper):
 
         sql = f"SELECT max(dt) AS max_dt FROM glassnode_1d WHERE item='ceo' AND coin='{coin}'"
         row = self.db.select_one(sql)
-        if row is None:
+        if row is None or row['max_dt'] is None:
             max_ts = self.str2ts('20150101')
         else:
             max_ts = self.dt2ts(row['max_dt'])
@@ -345,9 +519,430 @@ class ZSScraper(Scraper):
         df['coin'] = coin
         df['item'] = 'ceo'
         df = df.reset_index()
+        df['t'] = df['dt'].apply(self.dt2ts)
         # print(df.tail())
         self.db.insert_from_data_frame('glassnode_1d', df, replace='INSERT IGNORE')
         self.log(f'{coin} ceo success: {df.iloc[-1]["dt"]}')
+
+        df = None
+
+    def get_cycle_heat(self, coin='BTC'):
+        self.db.connect()
+
+        sql = f"SELECT max(dt) AS max_dt FROM glassnode_1d WHERE item='cycle_heat' AND coin='{coin}'"
+        row = self.db.select_one(sql)
+        earliest_ts = self.str2ts('20180101')
+        if row is None or row['max_dt'] is None:
+            max_ts = earliest_ts
+        else:
+            max_ts = self.dt2ts(row['max_dt'])
+
+        days_4y = 365 * 4
+        start_ts = max(earliest_ts, max_ts - 86400 * (days_4y + 40))
+        sql = f"""SELECT dt,
+                MAX(CASE WHEN item = 'fear_greed' THEN v ELSE NULL END) AS fear_greed,
+                MAX(CASE WHEN item = 'rhodl_ratio' THEN v ELSE NULL END) AS rhodl_ratio,
+                MAX(CASE WHEN item = 'supply_1y_pct' THEN v ELSE NULL END) AS supply_1y_pct,
+                MAX(CASE WHEN item = 'supply_pr_relative' THEN v ELSE NULL END) AS supply_pr_relative
+            FROM
+                glassnode_1d
+            WHERE coin = '{coin}' AND dt >= '{self.ts2str(start_ts)}'
+            GROUP BY dt ORDER BY dt
+        """
+
+        rows = self.db.select(sql)
+        df = pd.DataFrame(rows)
+        df = df.dropna()
+        if df.empty:
+            self.warn(f'{coin} cycle_heat skipped: missing component history')
+            return
+
+        df = df.set_index('dt')
+        df['fear_greed_slow'] = df['fear_greed'].ewm(span=7, adjust=False).mean()
+
+        df['f1'] = self._rolling_extreme_score(
+            df['fear_greed_slow'] - 50,
+            days_4y,
+            upper_scale=0.8,
+            lower_scale=0.8,
+        )
+        df['f2'] = self._rolling_extreme_score(
+            df['rhodl_ratio'],
+            days_4y,
+            upper_scale=1.0,
+            lower_scale=0.8,
+            log_transform=True,
+        )
+        df['f3'] = self._rolling_extreme_score(
+            df['supply_pr_relative'],
+            days_4y,
+            upper_scale=0.8,
+            lower_scale=0.8,
+        )
+        df['f4'] = self._rolling_extreme_score(
+            df['supply_1y_pct'],
+            days_4y,
+            upper_scale=0.8,
+            lower_scale=0.8,
+            reverse=True,
+        )
+        df['v'] = (df['f1'] + df['f2'] + df['f3'] + df['f4']).ewm(span=7, adjust=False).mean() / 4
+
+        df = df.loc[self.ts2str(max_ts):]
+        df = df[['v']]
+        df['coin'] = coin
+        df['item'] = 'cycle_heat'
+        df = df.reset_index()
+        df['t'] = df['dt'].apply(self.dt2ts)
+        self.db.insert_from_data_frame('glassnode_1d', df, replace='INSERT IGNORE')
+        self.log(f'{coin} cycle_heat success: {df.iloc[-1]["dt"]}')
+
+        df = None
+
+    def get_crowding_stress(self, coin='BTC'):
+        self.db.connect()
+
+        sql = f"SELECT max(dt) AS max_dt FROM glassnode_1h WHERE item='crowding_stress' AND coin='{coin}'"
+        row = self.db.select_one(sql)
+        earliest_ts = self.str2ts('20200201')
+        if row is None or row['max_dt'] is None:
+            max_ts = earliest_ts
+        else:
+            max_ts = self.dt2ts(row['max_dt'])
+
+        hours_1y = 24 * 365
+        start_ts = max(earliest_ts, max_ts - 3600 * (hours_1y + 72))
+        sql = f"""SELECT dt,
+                MAX(CASE WHEN item = 'funding_rate' THEN v ELSE NULL END) AS funding_rate,
+                MAX(CASE WHEN item = 'nupl' THEN v ELSE NULL END) AS nupl,
+                MAX(CASE WHEN item = 'mvrv' THEN v ELSE NULL END) AS mvrv
+            FROM
+                glassnode_1h
+            WHERE coin = '{coin}' AND dt >= '{self.ts2str(start_ts)}'
+            GROUP BY dt ORDER BY dt
+        """
+
+        rows = self.db.select(sql)
+        df = pd.DataFrame(rows)
+        df = df.dropna()
+        if df.empty:
+            self.warn(f'{coin} crowding_stress skipped: missing component history')
+            return
+
+        df = df.set_index('dt')
+        df['funding_rate_slow'] = df['funding_rate'].ewm(span=24, adjust=False).mean()
+        df['nupl_slow'] = df['nupl'].ewm(span=24, adjust=False).mean()
+        df['mvrv_centered'] = df['mvrv'].ewm(span=24, adjust=False).mean() - 1
+
+        df['f1'] = self._rolling_extreme_score(
+            df['funding_rate_slow'],
+            hours_1y,
+            upper_scale=0.8,
+            lower_scale=0.8,
+        )
+        df['f2'] = self._rolling_extreme_score(
+            df['nupl_slow'],
+            hours_1y,
+            upper_scale=0.8,
+            lower_scale=0.8,
+        )
+        df['f3'] = self._rolling_extreme_score(
+            df['mvrv_centered'],
+            hours_1y,
+            upper_scale=0.8,
+            lower_scale=0.8,
+        )
+        df['v'] = (df['f1'] + df['f2'] + df['f3']).ewm(span=24, adjust=False).mean() / 3
+
+        df = df.loc[self.ts2str(max_ts):]
+        df = df[['v']]
+        df['coin'] = coin
+        df['item'] = 'crowding_stress'
+        df = df.reset_index()
+        df['t'] = df['dt'].apply(self.dt2ts)
+        self.db.insert_from_data_frame('glassnode_1h', df, replace='INSERT IGNORE')
+        self.log(f'{coin} crowding_stress success: {df.iloc[-1]["dt"]}')
+
+        df = None
+
+    def get_holder_pressure(self, coin='BTC'):
+        self.db.connect()
+
+        earliest_ts = self.str2ts('20100101')
+
+        hours_1y = 24 * 365
+        start_ts = earliest_ts
+        sql = f"""SELECT dt,
+                MAX(CASE WHEN item = 'asopr' THEN v ELSE NULL END) AS asopr,
+                MAX(CASE WHEN item = 'nrpl' THEN v ELSE NULL END) AS nrpl,
+                MAX(CASE WHEN item = 'sth_nupl' THEN v ELSE NULL END) AS sth_nupl,
+                MAX(CASE WHEN item = 'sth_mvrv' THEN v ELSE NULL END) AS sth_mvrv
+            FROM
+                glassnode_1h
+            WHERE coin = '{coin}' AND dt >= '{self.ts2str(start_ts)}'
+            GROUP BY dt ORDER BY dt
+        """
+
+        rows = self.db.select(sql)
+        df = pd.DataFrame(rows)
+        if df.empty:
+            self.warn(f'{coin} holder_pressure skipped: missing component history')
+            return
+
+        component_cols = ['asopr', 'nrpl', 'sth_nupl', 'sth_mvrv']
+        df['dt'] = pd.to_datetime(df['dt'])
+        df = df.set_index('dt').sort_index()
+        full_index = pd.date_range(df.index.min(), df.index.max(), freq='1h')
+        df = df.reindex(full_index)
+        df.index.name = 'dt'
+        # Composite values may tolerate isolated source holes, but only by carrying
+        # the last known observation forward. This avoids lookahead while repairing
+        # single-bar gaps like the sporadic ASOPR misses we observed in production.
+        df[component_cols] = df[component_cols].ffill(limit=1)
+        df = df.dropna(subset=component_cols)
+        if df.empty:
+            self.warn(f'{coin} holder_pressure skipped: missing component history')
+            return
+
+        df['asopr_centered'] = df['asopr'].ewm(span=24, adjust=False).mean() - 1
+        df['nrpl_slow'] = df['nrpl'].ewm(span=24, adjust=False).mean()
+        df['sth_nupl_slow'] = df['sth_nupl'].ewm(span=24, adjust=False).mean()
+        df['sth_mvrv_centered'] = df['sth_mvrv'].ewm(span=24, adjust=False).mean() - 1
+
+        df['f1'] = self._rolling_extreme_score(
+            df['asopr_centered'],
+            hours_1y,
+            upper_scale=0.8,
+            lower_scale=0.8,
+        )
+        df['f2'] = self._rolling_extreme_score(
+            df['nrpl_slow'],
+            hours_1y,
+            upper_scale=0.9,
+            lower_scale=0.9,
+        )
+        df['f3'] = self._rolling_extreme_score(
+            df['sth_nupl_slow'],
+            hours_1y,
+            upper_scale=0.8,
+            lower_scale=0.8,
+        )
+        df['f4'] = self._rolling_extreme_score(
+            df['sth_mvrv_centered'],
+            hours_1y,
+            upper_scale=0.8,
+            lower_scale=0.8,
+        )
+        df['v'] = (df['f1'] + df['f2'] + df['f3'] + df['f4']).ewm(span=24, adjust=False).mean() / 4
+
+        df = df[['v']]
+        df['coin'] = coin
+        df['item'] = 'holder_pressure'
+        df = df.reset_index()
+        df['t'] = df['dt'].apply(self.dt2ts)
+        cursor = self.db.connect().cursor()
+        cursor.execute("DELETE FROM glassnode_1h WHERE item=%s AND coin=%s", ('holder_pressure', coin))
+        self.db.conn.commit()
+        self.db.insert_from_data_frame('glassnode_1h', df, replace='INSERT IGNORE')
+        self.log(f'{coin} holder_pressure success: {df.iloc[-1]["dt"]}')
+
+        df = None
+
+    def get_exchange_pressure(self, coin='BTC'):
+        self.db.connect()
+
+        earliest_ts = self.str2ts('20110817')
+        hours_1y = 24 * 365
+        sql = f"""SELECT dt,
+                MAX(CASE WHEN item = 'inflow' THEN v ELSE NULL END) AS inflow,
+                MAX(CASE WHEN item = 'net_transfer' THEN v ELSE NULL END) AS net_transfer,
+                MAX(CASE WHEN item = 'balance' THEN v ELSE NULL END) AS balance
+            FROM
+                glassnode_1h
+            WHERE coin = '{coin}' AND dt >= '{self.ts2str(earliest_ts)}'
+            GROUP BY dt ORDER BY dt
+        """
+
+        rows = self.db.select(sql)
+        df = pd.DataFrame(rows)
+        if df.empty:
+            self.warn(f'{coin} exchange_pressure skipped: missing component history')
+            return
+
+        component_cols = ['inflow', 'net_transfer', 'balance']
+        df['dt'] = pd.to_datetime(df['dt'])
+        df = df.set_index('dt').sort_index()
+        full_index = pd.date_range(df.index.min(), df.index.max(), freq='1h')
+        df = df.reindex(full_index)
+        df.index.name = 'dt'
+        df[component_cols] = df[component_cols].ffill(limit=1)
+        df = df.dropna(subset=component_cols)
+        if df.empty:
+            self.warn(f'{coin} exchange_pressure skipped: missing component history')
+            return
+
+        df['inflow_slow'] = df['inflow'].ewm(span=24, adjust=False).mean()
+        df['net_transfer_slow'] = df['net_transfer'].ewm(span=24, adjust=False).mean()
+        df['balance_delta_24h'] = df['balance'].diff(24).ewm(span=24, adjust=False).mean()
+        df = df.dropna(subset=['balance_delta_24h'])
+        if df.empty:
+            self.warn(f'{coin} exchange_pressure skipped: insufficient balance history')
+            return
+
+        df['f1'] = self._rolling_extreme_score(
+            df['inflow_slow'],
+            hours_1y,
+            upper_scale=0.9,
+            lower_scale=0.9,
+            log_transform=True,
+        )
+        df['f2'] = self._rolling_extreme_score(
+            df['net_transfer_slow'],
+            hours_1y,
+            upper_scale=0.9,
+            lower_scale=0.9,
+        )
+        df['f3'] = self._rolling_extreme_score(
+            df['balance_delta_24h'],
+            hours_1y,
+            upper_scale=0.9,
+            lower_scale=0.9,
+        )
+        df['v'] = (df['f1'] + df['f2'] + df['f3']).ewm(span=24, adjust=False).mean() / 3
+
+        df = df[['v']]
+        df['coin'] = coin
+        df['item'] = 'exchange_pressure'
+        df = df.reset_index()
+        df['t'] = df['dt'].apply(self.dt2ts)
+        cursor = self.db.connect().cursor()
+        cursor.execute("DELETE FROM glassnode_1h WHERE item=%s AND coin=%s", ('exchange_pressure', coin))
+        self.db.conn.commit()
+        self.db.insert_from_data_frame('glassnode_1h', df, replace='INSERT IGNORE')
+        self.log(f"{coin} exchange_pressure success: {df.iloc[-1]['dt']}")
+
+        df = None
+
+    def get_distribution_pressure(self, coin='BTC'):
+        self.db.connect()
+
+        earliest_ts = self.str2ts('20200202')
+        sql = f"""SELECT dt,
+                MAX(CASE WHEN item = 'holder_pressure' THEN v ELSE NULL END) AS holder_pressure,
+                MAX(CASE WHEN item = 'exchange_pressure' THEN v ELSE NULL END) AS exchange_pressure,
+                MAX(CASE WHEN item = 'crowding_stress' THEN v ELSE NULL END) AS crowding_stress
+            FROM
+                glassnode_1h
+            WHERE coin = '{coin}' AND dt >= '{self.ts2str(earliest_ts)}'
+            GROUP BY dt ORDER BY dt
+        """
+
+        rows = self.db.select(sql)
+        df = pd.DataFrame(rows)
+        if df.empty:
+            self.warn(f'{coin} distribution_pressure skipped: missing component history')
+            return
+
+        component_cols = ['holder_pressure', 'exchange_pressure', 'crowding_stress']
+        df['dt'] = pd.to_datetime(df['dt'])
+        df = df.set_index('dt').sort_index()
+        full_index = pd.date_range(df.index.min(), df.index.max(), freq='1h')
+        df = df.reindex(full_index)
+        df.index.name = 'dt'
+        df[component_cols] = df[component_cols].ffill(limit=1)
+        df = df.dropna(subset=component_cols)
+        if df.empty:
+            self.warn(f'{coin} distribution_pressure skipped: missing component history')
+            return
+
+        df['v'] = (
+            (df['holder_pressure'] + df['exchange_pressure'] + df['crowding_stress']) / 3
+        ).ewm(span=24, adjust=False).mean()
+
+        df = df[['v']]
+        df['coin'] = coin
+        df['item'] = 'distribution_pressure'
+        df = df.reset_index()
+        df['t'] = df['dt'].apply(self.dt2ts)
+        cursor = self.db.connect().cursor()
+        cursor.execute("DELETE FROM glassnode_1h WHERE item=%s AND coin=%s", ('distribution_pressure', coin))
+        self.db.conn.commit()
+        self.db.insert_from_data_frame('glassnode_1h', df, replace='INSERT IGNORE')
+        self.log(f"{coin} distribution_pressure success: {df.iloc[-1]['dt']}")
+
+        df = None
+
+    def get_valuation_stretch(self, coin='BTC'):
+        self.db.connect()
+
+        sql = f"SELECT max(dt) AS max_dt FROM glassnode_1d WHERE item='valuation_stretch' AND coin='{coin}'"
+        row = self.db.select_one(sql)
+        earliest_ts = self.str2ts('20180101')
+        if row is None or row['max_dt'] is None:
+            max_ts = earliest_ts
+        else:
+            max_ts = self.dt2ts(row['max_dt'])
+
+        days_4y = 365 * 4
+        start_ts = max(earliest_ts, max_ts - 86400 * (days_4y + 40))
+        sql = f"""SELECT dt,
+                MAX(CASE WHEN item = 'mvrv' THEN v ELSE NULL END) AS mvrv,
+                MAX(CASE WHEN item = 'asopr' THEN v ELSE NULL END) AS asopr,
+                MAX(CASE WHEN item = 'rhodl_ratio' THEN v ELSE NULL END) AS rhodl_ratio,
+                MAX(CASE WHEN item = 'fear_greed' THEN v ELSE NULL END) AS fear_greed
+            FROM
+                glassnode_1d
+            WHERE coin = '{coin}' AND dt >= '{self.ts2str(start_ts)}'
+            GROUP BY dt ORDER BY dt
+        """
+
+        rows = self.db.select(sql)
+        df = pd.DataFrame(rows)
+        df = df.dropna()
+        if df.empty:
+            self.warn(f'{coin} valuation_stretch skipped: missing component history')
+            return
+
+        df = df.set_index('dt')
+        df['fear_greed_slow'] = df['fear_greed'].ewm(span=7, adjust=False).mean()
+        df['mvrv_centered'] = df['mvrv'].ewm(span=7, adjust=False).mean() - 1
+        df['asopr_centered'] = df['asopr'].ewm(span=7, adjust=False).mean() - 1
+
+        df['f1'] = self._rolling_extreme_score(
+            df['mvrv_centered'],
+            days_4y,
+            upper_scale=0.8,
+            lower_scale=0.8,
+        )
+        df['f2'] = self._rolling_extreme_score(
+            df['asopr_centered'],
+            days_4y,
+            upper_scale=0.8,
+            lower_scale=0.8,
+        )
+        df['f3'] = self._rolling_extreme_score(
+            df['rhodl_ratio'],
+            days_4y,
+            upper_scale=1.0,
+            lower_scale=0.8,
+            log_transform=True,
+        )
+        df['f4'] = self._rolling_extreme_score(
+            df['fear_greed_slow'] - 50,
+            days_4y,
+            upper_scale=0.8,
+            lower_scale=0.8,
+        )
+        df['v'] = (df['f1'] + df['f2'] + df['f3'] + df['f4']).ewm(span=7, adjust=False).mean() / 4
+
+        df = df.loc[self.ts2str(max_ts):]
+        df = df[['v']]
+        df['coin'] = coin
+        df['item'] = 'valuation_stretch'
+        df = df.reset_index()
+        df['t'] = df['dt'].apply(self.dt2ts)
+        self.db.insert_from_data_frame('glassnode_1d', df, replace='INSERT IGNORE')
+        self.log(f'{coin} valuation_stretch success: {df.iloc[-1]["dt"]}')
 
         df = None
 
@@ -387,12 +982,14 @@ class ZSScraper(Scraper):
                 })
             } for d in data]
 
-    def update_gn(self, to_update=set()):
+    def update_gn(self, to_update=None):
         # self.login()
         self.page.change_mode('s', go=False)
         self.db.connect()
+        selected_targets = set(to_update) if to_update else set()
 
         not_updated = set()
+        blocked_access = set()
         for indicator, options in self.path_lookup.items():
             # query = '&'.join(f"{key}={value}" for key, value in lookup['params'].items())
             base_url = f"https://api.glassnode.com/v1/metrics/{options['path']}?"
@@ -405,7 +1002,7 @@ class ZSScraper(Scraper):
 
                     hash_id = f"{asset}_{indicator}_{tf}"
 
-                    if to_update and hash_id not in to_update:
+                    if selected_targets and hash_id not in selected_targets:
                         continue
 
                     # if hash_id != 'ETH_sth_nupl_1h':
@@ -486,15 +1083,14 @@ class ZSScraper(Scraper):
                             # print(df['dt'].iloc[-1], data[-1])
                             self.db.insert_from_data_frame(table, new, replace='INSERT IGNORE')
                             self.log(f'{hash_id} success: {new.iloc[-1]["dt"]}')
-                            # if hash_id in to_update:
+                            # if hash_id in selected_targets:
                             #     to_update.remove(hash_id)
 
-                            for computed_item, units in self.computed_items.items():
+                            for computed_target, units in self.computed_items.items():
                                 if hash_id in units:
                                     units.remove(hash_id)
                                     if not units:
-                                        # del self.computed_items[computed_item]
-                                        getattr(self, 'get_' + computed_item)()
+                                        self.compute_composite_target(computed_target)
 
                             if 'mutable' in options:
                                 old_in_db = self.old_in_db_map.get(hash_id)
@@ -524,10 +1120,16 @@ class ZSScraper(Scraper):
 
                         sleep(2.88)
 
+                    except PermissionError as e:
+                        blocked_access.add(hash_id)
+                        self.error(str(e))
+                        break
                     except:
                         self.exception(f'{indicator} {asset} {interval} failed')
                         break
 
+        if blocked_access:
+            self.warn(f'权限受限未更新：{blocked_access}')
         if not_updated:
             if datetime.now().minute < 30:
                 sleep(10)
@@ -538,8 +1140,22 @@ class ZSScraper(Scraper):
                 self.warn(f'超时未更新：{not_updated}')
         self.db.close()
 
-    def main(self):
-        self.run_once()
+    def main(
+        self,
+        to_update=None,
+        composite_targets=None,
+        force_recompute_composites=False,
+        composite_only=False,
+    ):
+        if composite_only:
+            self.run_composites(composite_targets=composite_targets)
+            return
+
+        self.run_once(
+            to_update=to_update,
+            composite_targets=composite_targets,
+            force_recompute_composites=force_recompute_composites,
+        )
 
         if not RUN_FOREVER:
             return
@@ -549,9 +1165,18 @@ class ZSScraper(Scraper):
             wait = 3600 - ts % 3600 + 5
             self.log(f"sleep {wait} seconds")
             sleep(wait)
-            self.run_once()
+            self.run_once(
+                to_update=to_update,
+                composite_targets=composite_targets,
+                force_recompute_composites=force_recompute_composites,
+            )
 
-    def run_once(self):
+    def run_once(
+        self,
+        to_update=None,
+        composite_targets=None,
+        force_recompute_composites=False,
+    ):
         self.db.connect()
         tables = ['glassnode_1h', 'glassnode_1d', 'glassnode_json_1d']
         self.max_t = {}
@@ -574,11 +1199,11 @@ class ZSScraper(Scraper):
 
         self.db.close()
 
-        if 1:
-            self.computed_items = {
-                'ceo': ['BTC_puell_1d', 'BTC_mvrv_1d', 'BTC_asopr_1d', 'BTC_reserve_risk_1d']
-            }
-            self.update_gn()
+        self.computed_items = self.build_computed_items(composite_targets=composite_targets)
+        self.update_gn(to_update=to_update)
+
+        if force_recompute_composites:
+            self.run_composites(composite_targets=composite_targets)
 
 
 if __name__ == "__main__":

@@ -27,5 +27,8 @@ class LoggerClient:
     def warn(self, message: str):
         self.logger.warning(message)
 
+    def error(self, message: str):
+        self.logger.error(message)
+
     def exception(self, message: str):
         self.logger.exception(message)

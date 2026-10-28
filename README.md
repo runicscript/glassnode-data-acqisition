@@ -18,6 +18,66 @@ This project keeps the Glassnode scraping logic from the original scripts and re
 3. Copy `.env.example` to `.env` or export the environment variables manually.
 4. Run `python3 main.py`.
 
+## BTC-First Run Profiles
+
+To avoid running every configured metric on day one, `main.py` now supports target profiles.
+
+- `btc_min`: `BTC_nupl_1h`, `BTC_nupl_1d`, `BTC_mvrv_1h`, `BTC_mvrv_1d`, `BTC_funding_rate_1h`
+- `btc_ceo_core`: `BTC_puell_1d`, `BTC_mvrv_1d`, `BTC_asopr_1d`, `BTC_reserve_risk_1d`
+- `btc_cycle_heat_core`: `BTC_fear_greed_1d`, `BTC_rhodl_ratio_1d`, `BTC_supply_1y_pct_1d`, `BTC_supply_pr_relative_1d`
+- `btc_crowding_stress_core`: `BTC_funding_rate_1h`, `BTC_nupl_1h`, `BTC_mvrv_1h`
+- `btc_holder_pressure_core`: `BTC_asopr_1h`, `BTC_nrpl_1h`, `BTC_sth_nupl_1h`, `BTC_sth_mvrv_1h`
+- `btc_exchange_pressure_core`: `BTC_inflow_1h`, `BTC_balance_1h`, `BTC_net_transfer_1h`
+- `btc_distribution_pressure_core`: raw inputs for `crowding_stress`, `holder_pressure`, and `exchange_pressure`, used to rebuild the higher-order BTC distribution-pressure composite
+- `btc_valuation_stretch_core`: `BTC_mvrv_1d`, `BTC_asopr_1d`, `BTC_rhodl_ratio_1d`, `BTC_fear_greed_1d`
+
+Preview targets without scraping:
+
+```bash
+python3 main.py --profile btc_min --dry-run-targets
+```
+
+Run BTC minimum profile:
+
+```bash
+python3 main.py --profile btc_min
+```
+
+Optional fine-grained filters:
+
+```bash
+python3 main.py --profile all --coins BTC --items nupl,mvrv --timeframes 1h,1d
+```
+
+Composite maintenance:
+
+```bash
+python3 main.py --dry-run-targets --composite-items ceo --coins BTC
+python3 main.py --profile btc_ceo_core --coins BTC --composite-items ceo
+python3 main.py --composite-only --composite-items ceo --coins BTC
+python3 main.py --profile btc_cycle_heat_core --coins BTC --composite-items cycle_heat
+python3 main.py --composite-only --composite-items cycle_heat --coins BTC
+python3 main.py --profile btc_crowding_stress_core --coins BTC --composite-items crowding_stress
+python3 main.py --composite-only --composite-items crowding_stress --coins BTC
+python3 main.py --profile btc_holder_pressure_core --coins BTC --composite-items holder_pressure
+python3 main.py --composite-only --composite-items holder_pressure --coins BTC
+python3 main.py --profile btc_exchange_pressure_core --coins BTC --composite-items exchange_pressure
+python3 main.py --composite-only --composite-items exchange_pressure --coins BTC
+python3 main.py --profile btc_distribution_pressure_core --coins BTC --composite-items holder_pressure,exchange_pressure,crowding_stress,distribution_pressure
+python3 main.py --composite-only --composite-items distribution_pressure --coins BTC
+
+python3 main.py --profile btc_valuation_stretch_core --coins BTC --composite-items valuation_stretch
+python3 main.py --composite-only --composite-items valuation_stretch --coins BTC
+```
+
+Notes:
+
+- `--timeframes` accepts `1h`, `1d`, and `24h` (`24h` maps to `1d`).
+- If filters produce zero targets, the runner exits with an explicit error.
+- `--composite-items` selects derived indicators such as `ceo`.
+- `--composite-only` rebuilds derived indicators directly from the current database state and does not require a browser login.
+- `holder_pressure` currently tolerates isolated 1h source holes by carrying forward the previous source value for one bar only; this avoids lookahead while keeping the persisted composite gap-free.
+
 If Chromium is not detected automatically, set `BROWSER_PATH` in `.env`.
 
 ## Current Storage
