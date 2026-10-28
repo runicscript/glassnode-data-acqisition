@@ -1,5 +1,21 @@
+# Secrets
 .env
+.env.*
+!.env.example
+
+# Python / env
 .venv/
 __pycache__/
-.DS_Store
+*.py[cod]
+
+# Local data / logs
 data/
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
